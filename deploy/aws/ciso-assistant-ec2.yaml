@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CISO Assistant on a single EC2 instance (Docker Compose: PostgreSQL, backend,
+  huey, frontend, Caddy with automatic Let's Encrypt TLS). Access via SSM Session
+  Manager; no SSH port is opened. Daily EBS snapshots are kept for 14 days.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: FQDN users will browse to (e.g. grc.example.com). Point its DNS A record at the ElasticIP output.
+    AllowedPattern: "^[a-zA-Z0-9.-]+$"
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues: [t3.medium, t3.large, t3.xlarge, m6i.large, m6i.xlarge]
+    Description: t3.large (8 GiB RAM) is the recommended minimum for production use.
+  VolumeSize:
+    Type: Number
+    Default: 40
+    MinValue: 20
+    Description: Root EBS volume size in GiB (holds the OS, images, PostgreSQL data and attachments).
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: CISO Assistant image tag to deploy (pin a release, e.g. v3.x.y, for reproducible deploys).
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to reach HTTP/HTTPS. Port 80 must stay reachable from the internet for Let's Encrypt.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CISO Assistant web traffic
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: "HTTP (ACME challenge + redirect)" }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr, Description: HTTPS }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # The Elastic IP is bound to this ENI before the instance boots, so user data
+  # has internet access from the start and the public IP never changes.
+  NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      GroupSet: [!Ref SecurityGroup]
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+
+  ElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      NetworkInterfaceId: !Ref NetworkInterface
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [ElasticIPAssociation, DefaultRoute, SubnetRouteTableAssociation]
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref NetworkInterface
+          DeviceIndex: "0"
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}" }
+        - { Key: Backup, Value: !Sub "${AWS::StackName}" }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
+          apt-get update
+          apt-get install -y ca-certificates curl openssl
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          systemctl enable --now docker
+
+          APP=/opt/ciso-assistant
+          mkdir -p $APP/db $APP/caddy_data
+          chown -R 1001:1001 $APP/db
+          cd $APP
+
+          if [ ! -f .env ]; then
+            umask 077
+            cat > .env <<ENV
+          FQDN=${DomainName}
+          TAG=${ImageTag}
+          POSTGRES_PASSWORD=$(openssl rand -hex 24)
+          DJANGO_SECRET_KEY=$(openssl rand -hex 32)
+          ENV
+          fi
+
+          cat > docker-compose.yml <<'COMPOSE'
+          x-backend-env: &backend-env
+            ALLOWED_HOSTS: backend,localhost,${!FQDN}
+            CISO_ASSISTANT_URL: https://${!FQDN}
+            DJANGO_DEBUG: "False"
+            DJANGO_SECRET_KEY: ${!DJANGO_SECRET_KEY}
+            AUTH_TOKEN_TTL: "7200"
+            POSTGRES_NAME: ciso_assistant
+            POSTGRES_USER: ciso_assistant
+            POSTGRES_PASSWORD: ${!POSTGRES_PASSWORD}
+            DB_HOST: postgres
+            HOME: /tmp
+            XDG_CACHE_HOME: /tmp/.cache
+            XDG_CONFIG_HOME: /tmp/.config
+            XDG_DATA_HOME: /tmp/.local/share
+
+          x-hardening: &hardening
+            read_only: true
+            cap_drop: [ALL]
+            security_opt: ["no-new-privileges:true"]
+            tmpfs: ["/tmp:rw,noexec,nosuid,nodev"]
+            user: "1001:1001"
+
+          services:
+            postgres:
+              image: postgres:16
+              restart: always
+              environment:
+                POSTGRES_DB: ciso_assistant
+                POSTGRES_USER: ciso_assistant
+                POSTGRES_PASSWORD: ${!POSTGRES_PASSWORD}
+              volumes:
+                - ./db/pg:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U ciso_assistant -d ciso_assistant"]
+                interval: 10s
+                retries: 30
+
+            backend:
+              <<: *hardening
+              image: ghcr.io/intuitem/ciso-assistant-community/backend:${!TAG}
+              restart: always
+              depends_on:
+                postgres: { condition: service_healthy }
+              environment: *backend-env
+              volumes: ["./db:/code/db"]
+              healthcheck:
+                test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://backend:8000/api/health/', timeout=5)"]
+                interval: 10s
+                timeout: 10s
+                retries: 30
+                start_period: 150s
+
+            huey:
+              <<: *hardening
+              image: ghcr.io/intuitem/ciso-assistant-community/backend:${!TAG}
+              restart: always
+              depends_on:
+                backend: { condition: service_healthy }
+              environment: *backend-env
+              volumes: ["./db:/code/db"]
+              entrypoint: ["/bin/sh", "-c", "python manage.py run_huey -w 2 --scheduler-interval 60"]
+
+            frontend:
+              <<: *hardening
+              image: ghcr.io/intuitem/ciso-assistant-community/frontend:${!TAG}
+              restart: always
+              depends_on:
+                backend: { condition: service_healthy }
+              environment:
+                PUBLIC_BACKEND_API_URL: http://backend:8000/api
+                PUBLIC_BACKEND_API_EXPOSED_URL: https://${!FQDN}/api
+                PROTOCOL_HEADER: x-forwarded-proto
+                HOST_HEADER: x-forwarded-host
+                HOME: /tmp
+
+            caddy:
+              image: caddy:2.11.4
+              restart: always
+              depends_on:
+                backend: { condition: service_healthy }
+              ports: ["80:80", "443:443"]
+              volumes:
+                - ./caddy_data:/data
+                - ./Caddyfile:/etc/caddy/Caddyfile:ro
+          COMPOSE
+
+          cat > Caddyfile <<CADDY
+          ${DomainName} {
+            reverse_proxy /api/* backend:8000
+            reverse_proxy /* frontend:3000
+          }
+          CADDY
+
+          for i in 1 2 3 4 5; do docker compose pull && break; sleep 15; done
+          docker compose up -d
+
+  SnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dlm.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: !Sub "Daily snapshots for ${AWS::StackName}"
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt SnapshotRole.Arn
+      PolicyDetails:
+        ResourceTypes: [INSTANCE]
+        TargetTags:
+          - { Key: Backup, Value: !Sub "${AWS::StackName}" }
+        Schedules:
+          - Name: daily
+            CopyTags: true
+            CreateRule: { Interval: 24, IntervalUnit: HOURS, Times: ["03:00"] }
+            RetainRule: { Count: 14 }
+
+Outputs:
+  ElasticIP:
+    Description: Create a DNS A record for DomainName pointing to this IP.
+    Value: !Ref ElasticIP
+  Url:
+    Value: !Sub "https://${DomainName}"
+  InstanceId:
+    Description: Use with `aws ssm start-session --target <id>` to get a shell.
+    Value: !Ref Instance
